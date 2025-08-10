@@ -1,15 +1,7 @@
 import React, { useEffect, useRef } from 'react';
 import * as d3 from 'd3';
 
-function isMultiSeries(data)
-{
-    if (!Array.isArray(data) || data.length === 0) return false;
-    const first = data[0];
-    if (!Array.isArray(first) || first.length < 2) return false;
-    return Array.isArray(first[1]);
-}
-
-function computeYExtent(values)
+function computeYAxisExtent(values)
 {
     const numeric = values.filter((v) => v !== null && v !== undefined && !Number.isNaN(v));
     if (numeric.length === 0)
@@ -24,6 +16,89 @@ function computeYExtent(values)
     return extent;
 }
 
+const SERIES_COLORS = ['blue', 'green', 'red'];
+
+function setupSVG(svgRef, width, height, margin)
+{
+    const svg = d3.select(svgRef.current);
+    svg.selectAll('*').remove();
+
+    return svg
+        .attr('width', width)
+        .attr('height', height)
+        .append('g')
+        .attr('transform', `translate(${ margin.left },${ margin.top })`);
+}
+
+function createXScale(data, innerWidth)
+{
+    const xValues = data
+        .map((d) => (Array.isArray(d) ? d[0] : null))
+        .filter((v) => v !== null && v !== undefined && !Number.isNaN(v));
+    const xDomain = d3.extent(xValues);
+    return d3.scaleLinear().domain(xDomain).nice().range([0, innerWidth]);
+}
+
+function getSeriesInfo(data)
+{
+    const firstPointYValues = Array.isArray(data[0]) ? data[0][1] : undefined;
+    const hasMultipleSeries = Array.isArray(firstPointYValues);
+    const seriesCount = hasMultipleSeries ? Math.min(3, (firstPointYValues?.length || 0)) : 1;
+    return { hasMultipleSeries, seriesCount };
+}
+
+function createYScale(data, hasMultipleSeries, innerHeight)
+{
+    const allYValues = hasMultipleSeries
+        ? data.flatMap((d) => (Array.isArray(d) && Array.isArray(d[1]) ? d[1] : []))
+        : data.map((d) => (Array.isArray(d) ? d[1] : null));
+    const yDomain = computeYAxisExtent(allYValues);
+    return d3.scaleLinear().domain(yDomain).nice().range([innerHeight, 0]);
+}
+
+function drawAxes(chartGroup, xScale, yScale, innerHeight)
+{
+    chartGroup.append('g')
+        .attr('transform', `translate(0,${ innerHeight })`)
+        .call(d3.axisBottom(xScale).ticks(6));
+    chartGroup.append('g')
+        .call(d3.axisLeft(yScale).ticks(5));
+}
+
+function createLineGenerator(xScale, yScale, hasMultipleSeries, seriesIndex)
+{
+    return d3.line()
+        .defined((d) =>
+        {
+            if (!Array.isArray(d)) return false;
+            const timestamp = d[0];
+            const yValue = hasMultipleSeries ? (Array.isArray(d[1]) ? d[1][seriesIndex] ?? null : null) : d[1];
+            return timestamp !== null && timestamp !== undefined && !Number.isNaN(timestamp) &&
+                yValue !== null && yValue !== undefined && !Number.isNaN(yValue);
+        })
+        .x((d) => xScale(d[0]))
+        .y((d) =>
+        {
+            const yValue = hasMultipleSeries ? (Array.isArray(d[1]) ? d[1][seriesIndex] ?? null : null) : d[1];
+            return yScale(yValue);
+        });
+}
+
+function drawSeries(chartGroup, data, seriesCount, hasMultipleSeries, xScale, yScale)
+{
+    for (let i = 0; i < seriesCount; i += 1)
+    {
+        const lineGenerator = createLineGenerator(xScale, yScale, hasMultipleSeries, i);
+
+        chartGroup.append('path')
+            .datum(data)
+            .attr('fill', 'none')
+            .attr('stroke', SERIES_COLORS[i % SERIES_COLORS.length])
+            .attr('stroke-width', 0.7)
+            .attr('d', lineGenerator);
+    }
+}
+
 export default function Chart({ title, data, width = 700, height = 320 })
 {
     const svgRef = useRef(null);
@@ -36,85 +111,13 @@ export default function Chart({ title, data, width = 700, height = 320 })
         const innerWidth = width - margin.left - margin.right;
         const innerHeight = height - margin.top - margin.bottom;
 
-        const svg = d3.select(svgRef.current);
-        svg.selectAll('*').remove();
+        const chartGroup = setupSVG(svgRef, width, height, margin);
+        const xScale = createXScale(data, innerWidth);
+        const { hasMultipleSeries, seriesCount } = getSeriesInfo(data);
+        const yScale = createYScale(data, hasMultipleSeries, innerHeight);
 
-        const root = svg
-            .attr('width', width)
-            .attr('height', height)
-            .append('g')
-            .attr('transform', `translate(${ margin.left },${ margin.top })`);
-
-        // Set X as timestamps, Y as values
-        const xValues = data.map((d) => (Array.isArray(d) ? d[0] : null)).filter((v) => v !== null);
-        const xDomain = d3.extent(xValues);
-        const x = d3.scaleLinear().domain(xDomain).nice().range([0, innerWidth]);
-
-        const multi = isMultiSeries(data);
-
-        if (!multi)
-        {
-            const seriesAll = data.map(([t, v]) => ({ x: t, y: v })).sort((a, b) => a.x - b.x);
-            const yDomain = computeYExtent(seriesAll.map((p) => p.y));
-            const y = d3.scaleLinear().domain(yDomain).nice().range([innerHeight, 0]);
-
-            // Axes
-            root.append('g').attr('transform', `translate(0,${ innerHeight })`).call(d3.axisBottom(x).ticks(6));
-            root.append('g').call(d3.axisLeft(y).ticks(5));
-
-            const lineGen = d3.line()
-                .defined((d) => d.y !== null && d.y !== undefined && !Number.isNaN(d.y))
-                .x((d) => x(d.x))
-                .y((d) => y(d.y));
-
-            root.append('path')
-                .datum(seriesAll)
-                .attr('fill', 'none')
-                .attr('stroke', 'blue')
-                .attr('stroke-width', 0.7)
-                .attr('d', lineGen);
-        } else
-        {
-            // Build three independent series; sort by timestamp
-            const s1 = data.map(([t, arr]) => ({ x: t, y: Array.isArray(arr) ? (arr[0] ?? null) : null })).sort((a, b) => a.x - b.x);
-            const s2 = data.map(([t, arr]) => ({ x: t, y: Array.isArray(arr) ? (arr[1] ?? null) : null })).sort((a, b) => a.x - b.x);
-            const s3 = data.map(([t, arr]) => ({ x: t, y: Array.isArray(arr) ? (arr[2] ?? null) : null })).sort((a, b) => a.x - b.x);
-
-            const yDomain = computeYExtent(
-                s1.map((p) => p.y).concat(s2.map((p) => p.y)).concat(s3.map((p) => p.y))
-            );
-            const y = d3.scaleLinear().domain(yDomain).nice().range([innerHeight, 0]);
-
-            // Axes
-            root.append('g').attr('transform', `translate(0,${ innerHeight })`).call(d3.axisBottom(x).ticks(6));
-            root.append('g').call(d3.axisLeft(y).ticks(5));
-
-            const makeLine = d3.line()
-                .defined((d) => d.y !== null && d.y !== undefined && !Number.isNaN(d.y))
-                .x((d) => x(d.x))
-                .y((d) => y(d.y));
-
-            root.append('path')
-                .datum(s1)
-                .attr('fill', 'none')
-                .attr('stroke', 'blue')
-                .attr('stroke-width', 0.7)
-                .attr('d', makeLine);
-
-            root.append('path')
-                .datum(s2)
-                .attr('fill', 'none')
-                .attr('stroke', 'green')
-                .attr('stroke-width', 0.7)
-                .attr('d', makeLine);
-
-            root.append('path')
-                .datum(s3)
-                .attr('fill', 'none')
-                .attr('stroke', 'red')
-                .attr('stroke-width', 0.7)
-                .attr('d', makeLine);
-        }
+        drawAxes(chartGroup, xScale, yScale, innerHeight);
+        drawSeries(chartGroup, data, seriesCount, hasMultipleSeries, xScale, yScale);
     }, [data, width, height]);
 
     return (
